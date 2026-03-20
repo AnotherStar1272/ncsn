@@ -1,3 +1,17 @@
+"""
+这个文件是项目里的通用图像网络工具箱。
+
+主要内容：
+1. 网络辅助函数：归一化层、学习率调度器、权重初始化、设备初始化
+2. 生成器工厂：define_G
+3. 判别器工厂：define_D
+4. GAN 相关损失：GANLoss、gradient penalty
+5. 常见结构模块：ResNet generator、U-Net generator、PatchGAN discriminator
+
+在这个项目里，它不一定直接单独训练 pix2pix，
+而更多是作为其他模型文件复用的基础模块库。
+"""
+
 import torch
 import torch.nn as nn
 from torch.nn import init
@@ -9,6 +23,8 @@ from torch.optim import lr_scheduler
 # Helper Functions
 ###############################################################################
 def get_norm_layer(norm_type='instance'):
+    # 根据字符串返回归一化层构造器。
+    # 输出不是单个层，而是一个后续可继续调用的“层工厂”。
     """Return a normalization layer
 
     Parameters:
@@ -29,6 +45,8 @@ def get_norm_layer(norm_type='instance'):
 
 
 def get_scheduler(optimizer, opt):
+    # 根据训练配置选择学习率调度策略。
+    # 输出是一个 PyTorch scheduler，用来在训练过程中自动调节学习率。
     """Return a learning rate scheduler
 
     Parameters:
@@ -59,6 +77,7 @@ def get_scheduler(optimizer, opt):
 
 
 def init_weights(net, init_type='normal', init_gain=0.02):
+    # 统一初始化网络中的卷积层、线性层和 BatchNorm 层参数。
     """Initialize network weights.
 
     Parameters:
@@ -95,6 +114,7 @@ def init_weights(net, init_type='normal', init_gain=0.02):
 
 
 def init_net(net, init_type='normal', init_gain=0.02, gpu_ids=[]):
+    # 先把网络放到指定设备，再做权重初始化，最后返回可直接使用的网络。
     """Initialize a network: 1. register CPU/GPU device (with multi-GPU support); 2. initialize the network weights
     Parameters:
         net (network)      -- the network to be initialized
@@ -114,6 +134,8 @@ def init_net(net, init_type='normal', init_gain=0.02, gpu_ids=[]):
 
 def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, init_type='normal', init_gain=0.02,
              gpu_ids=[]):
+    # 生成器工厂函数：
+    # 根据 netG 的字符串名称，创建对应的 ResNet/U-Net 生成器。
     """Create a generator
 
     Parameters:
@@ -157,6 +179,8 @@ def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, in
 
 
 def define_D(input_nc, ndf, netD, n_layers_D=3, norm='batch', init_type='normal', init_gain=0.02, gpu_ids=[]):
+    # 判别器工厂函数：
+    # 根据 netD 的类型创建 PatchGAN、深层 PatchGAN 或 PixelGAN。
     """Create a discriminator
 
     Parameters:
@@ -204,6 +228,7 @@ def define_D(input_nc, ndf, netD, n_layers_D=3, norm='batch', init_type='normal'
 # Classes
 ##############################################################################
 class GANLoss(nn.Module):
+    # 统一封装多种 GAN 损失，外部只需要关心 prediction 和真假标签。
     """Define different GAN objectives.
 
     The GANLoss class abstracts away the need to create the target label tensor
@@ -273,6 +298,8 @@ class GANLoss(nn.Module):
 
 
 def cal_gradient_penalty(netD, real_data, fake_data, device, type='mixed', constant=1.0, lambda_gp=10.0):
+    # 计算 WGAN-GP 中使用的梯度惩罚项。
+    # 输出为 gradient penalty 标量，以及中间梯度张量。
     """Calculate the gradient penalty loss, used in WGAN-GP paper https://arxiv.org/abs/1704.00028
 
     Arguments:
@@ -312,6 +339,8 @@ def cal_gradient_penalty(netD, real_data, fake_data, device, type='mixed', const
 
 
 class ResnetGenerator(nn.Module):
+    # ResNet 风格生成器：
+    # 输入一张图像，经过下采样、若干残差块、再上采样，输出一张同分辨率图像。
     """Resnet-based generator that consists of Resnet blocks between a few downsampling/upsampling operations.
 
     We adapt Torch code and idea from Justin Johnson's neural style transfer project(https://github.com/jcjohnson/fast-neural-style)
@@ -374,6 +403,7 @@ class ResnetGenerator(nn.Module):
 
 
 class ResnetBlock(nn.Module):
+    # 最基础的残差块，输入输出通道数相同，通过 skip connection 稳定训练。
     """Define a Resnet block"""
 
     def __init__(self, dim, padding_type, norm_layer, use_dropout, use_bias):
@@ -429,11 +459,13 @@ class ResnetBlock(nn.Module):
 
     def forward(self, x):
         """Forward function (with skip connections)"""
-        out = x + self.conv_block(x)  # add skip connections
+        # `self.conv_block(x)` 会依次经过两次卷积/归一化/激活，张量形状通常仍保持为 [B, C, H, W]。
+        out = x + self.conv_block(x)  # 将残差分支与输入逐元素相加，输出形状仍为 [B, C, H, W]。
         return out
 
 
 class UnetGenerator(nn.Module):
+    # 标准 U-Net 生成器，特点是编码器和解码器之间有 skip connection。
     """Create a Unet-based generator"""
 
     def __init__(self, input_nc, output_nc, num_downs, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False):
@@ -467,10 +499,15 @@ class UnetGenerator(nn.Module):
 
     def forward(self, input):
         """Standard forward"""
+        # 输入通常是图像张量 [B, C_in, H, W]。
+        # `self.model` 是由多层递归的 U-Net 子模块组成，会先逐步下采样，再逐步上采样恢复分辨率。
+        # 最终输出形状通常为 [B, C_out, H, W]，空间尺寸回到输入大小。
         return self.model(input)
 
 
 class UnetSkipConnectionBlockWithResNet(nn.Module):
+    # 带 ResNet 子块的 U-Net 子模块。
+    # 这个块会递归嵌套，形成完整的 U-Net 编码器-解码器结构。
     """Defines the Unet submodule with skip connection.
         X -------------------identity----------------------
         |-- downsampling -- |submodule| -- upsampling --|
@@ -540,12 +577,17 @@ class UnetSkipConnectionBlockWithResNet(nn.Module):
 
     def forward(self, x):
         if self.outermost:
+            # 最外层时，不做拼接，直接让输入经过完整的下采样-子模块-上采样链路。
+            # 输出通常从 [B, C_in, H, W] 变为 [B, C_out, H, W]。
             return self.model(x)
         else:  # add skip connections
+            # 非最外层时，先让输入走内部子网络，输出大小通常恢复到与当前输入相同的 H、W。
+            # 然后把原输入与子网络输出在通道维拼接，形状从 [B, C, H, W] 变为 [B, C + C_sub, H, W]。
             return torch.cat([x, self.model(x)], 1)
 
 
 class UnetSkipConnectionBlock(nn.Module):
+    # 标准 U-Net 子模块，不带额外 ResNet 子块。
     """Defines the Unet submodule with skip connection.
         X -------------------identity----------------------
         |-- downsampling -- |submodule| -- upsampling --|
@@ -611,12 +653,17 @@ class UnetSkipConnectionBlock(nn.Module):
 
     def forward(self, x):
         if self.outermost:
+            # 最外层直接输出整个 U-Net 的结果，空间尺寸通常与输入一致。
             return self.model(x)
         else:  # add skip connections
+            # 中间层/内层会把当前层输入和解码后的特征在通道维拼接，形成 skip connection。
+            # 拼接后空间尺寸不变，通道数增加为两路特征之和。
             return torch.cat([x, self.model(x)], 1)
 
 
 class NLayerDiscriminator(nn.Module):
+    # PatchGAN 判别器：
+    # 输出不是一个全局标量，而是一张 patch-level 真伪得分图。
     """Defines a PatchGAN discriminator"""
 
     def __init__(self, input_nc, ndf=64, n_layers=3, norm_layer=nn.BatchNorm2d):
@@ -662,10 +709,15 @@ class NLayerDiscriminator(nn.Module):
 
     def forward(self, input):
         """Standard forward."""
+        # 输入通常是图像或图像对，形状约为 [B, C_in, H, W]。
+        # PatchGAN 会通过多层卷积逐步下采样并提取局部判别特征。
+        # 输出不是单个标量，而是一张 patch 级别的真伪得分图，形状约为 [B, 1, H', W']。
         return self.model(input)
 
 
 class PixelDiscriminator(nn.Module):
+    # PixelGAN 判别器：
+    # 只在像素级做真假判别，更关注局部统计，不太建模大范围空间结构。
     """Defines a 1x1 PatchGAN discriminator (pixelGAN)"""
 
     def __init__(self, input_nc, ndf=64, norm_layer=nn.BatchNorm2d):
@@ -694,4 +746,7 @@ class PixelDiscriminator(nn.Module):
 
     def forward(self, input):
         """Standard forward."""
+        # 输入形状通常为 [B, C_in, H, W]。
+        # 1x1 卷积只在通道维做变换，不改变空间尺寸，因此 H、W 基本保持不变。
+        # 输出是一张逐像素的判别得分图，形状通常为 [B, 1, H, W]。
         return self.net(input)

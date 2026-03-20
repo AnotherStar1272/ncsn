@@ -133,7 +133,11 @@ class ToyRunner():
         plt.title('Langevin dynamics model')
         plt.xlim([left_bound, right_bound])
         plt.ylim([left_bound, right_bound])
-        plt.show()
+        if savefig is not None:
+            plt.savefig(savefig + "/{}_langevin_model.png".format(step), bbox_inches='tight')
+            plt.close()
+        else:
+            plt.show()
 
         def data_score(x):
             x = x.detach()
@@ -163,7 +167,11 @@ class ToyRunner():
         plt.title('Langevin dynamics data')
         plt.xlim([left_bound, right_bound])
         plt.ylim([left_bound, right_bound])
-        plt.show()
+        if savefig is not None:
+            plt.savefig(savefig + "/{}_langevin_data.png".format(step), bbox_inches='tight')
+            plt.close()
+        else:
+            plt.show()
 
     @staticmethod
     def visualize_noise(noise_net):

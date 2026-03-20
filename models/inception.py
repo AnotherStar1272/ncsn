@@ -1,10 +1,34 @@
+"""
+这个文件封装了一个常见的 InceptionV3 特征提取器。
+
+主要用途：
+- 复用 torchvision 里的预训练 InceptionV3
+- 按 block 输出不同层级的特征图
+- 通常用于生成模型评价，例如提取 FID / Inception Score 所需的特征
+
+和直接使用 torchvision.models.inception_v3 的区别：
+- 这里只保留特征提取相关部分，不关心最终分类头
+- 可以灵活指定输出哪些中间 block 的结果
+"""
+
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
 
 
 class InceptionV3(nn.Module):
-    """Pretrained InceptionV3 network returning feature maps"""
+    """返回若干层特征图的预训练 InceptionV3。
+
+    作用：
+    - 输入一批 RGB 图像
+    - 输出指定 block 的特征张量列表
+
+    常见输出含义：
+    - block 0: 低层特征
+    - block 1: 更深一层的卷积特征
+    - block 2: aux classifier 之前的特征
+    - block 3: 最终全局平均池化后的高层语义特征
+    """
 
     # Index of default block of inception to return,
     # corresponds to output of final average pooling
@@ -23,27 +47,13 @@ class InceptionV3(nn.Module):
                  resize_input=True,
                  normalize_input=True,
                  requires_grad=False):
-        """Build pretrained InceptionV3
+        """构造预训练 InceptionV3 特征提取器。
 
-        Parameters
-        ----------
-        output_blocks : list of int
-            Indices of blocks to return features of. Possible values are:
-                - 0: corresponds to output of first max pooling
-                - 1: corresponds to output of second max pooling
-                - 2: corresponds to output which is fed to aux classifier
-                - 3: corresponds to output of final average pooling
-        resize_input : bool
-            If true, bilinearly resizes input to width and height 299 before
-            feeding input to model. As the network without fully connected
-            layers is fully convolutional, it should be able to handle inputs
-            of arbitrary size, so resizing might not be strictly needed
-        normalize_input : bool
-            If true, scales the input from range (0, 1) to the range the
-            pretrained Inception network expects, namely (-1, 1)
-        requires_grad : bool
-            If true, parameters of the model require gradient. Possibly useful
-            for finetuning the network
+        参数说明：
+        - output_blocks: 想返回哪些 block 的输出
+        - resize_input: 是否先把输入 resize 到 299x299
+        - normalize_input: 是否把输入从 (0, 1) 映射到 (-1, 1)
+        - requires_grad: 是否允许这个网络参与梯度更新
         """
         super(InceptionV3, self).__init__()
 
@@ -105,37 +115,42 @@ class InceptionV3(nn.Module):
             param.requires_grad = requires_grad
 
     def forward(self, inp):
-        """Get Inception feature maps
+        """提取 Inception 特征图。
 
-        Parameters
-        ----------
-        inp : torch.autograd.Variable
-            Input tensor of shape Bx3xHxW. Values are expected to be in
-            range (0, 1)
+        输入：
+        - inp: 形状为 [B, 3, H, W] 的图像张量，默认假定值域在 (0, 1)
 
-        Returns
-        -------
-        List of torch.autograd.Variable, corresponding to the selected output
-        block, sorted ascending by index
+        输出：
+        - 一个 list
+        - list 中每个元素对应一个被选中的 block 输出
+        - 顺序与 block 编号从小到大一致
         """
+        # outp 用来按顺序收集我们关心的 block 输出。
         outp = []
+        # x 初始就是原始输入，形状通常是 [B, 3, H, W]。
         x = inp
 
         if self.resize_input:
+            # 预训练 InceptionV3 通常希望输入接近 299x299。
+            # 如果打开该选项，这里会先把输入双线性插值到 [B, 3, 299, 299]。
             x = F.interpolate(x,
                               size=(299, 299),
                               mode='bilinear',
                               align_corners=False)
 
         if self.normalize_input:
+            # 把像素值从 (0, 1) 映射到 (-1, 1)，与预训练 Inception 的输入分布保持一致。
             x = 2 * x - 1  # Scale from range (0, 1) to range (-1, 1)
 
         for idx, block in enumerate(self.blocks):
+            # 依次通过每个 Inception block，x 的通道数和空间分辨率会逐步变化。
             x = block(x)
             if idx in self.output_blocks:
+                # 如果当前 block 是用户指定要输出的层，就把它当前的特征图收集起来。
                 outp.append(x)
 
             if idx == self.last_needed_block:
+                # 到达用户需要的最深 block 后就提前退出，避免做多余计算。
                 break
 
         return outp

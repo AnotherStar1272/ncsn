@@ -1,3 +1,17 @@
+"""
+这个文件定义了多种 score network / energy network 结构。
+
+它们的共同目标是：
+- 输入图像或低维向量
+- 输出与输入同形状的 score（即对数密度对输入的梯度近似）
+  或者输出一个能量值 / 标量
+
+这些模型会被不同的 runner 选择使用：
+- ScoreNetRunner 常用 ResScore
+- baseline / anneal 相关 runner 会更多使用 RefineNet 系列，不在本文件中
+- toy / 小尺寸实验会用到这里的 MLPScore、SmallScore 等
+"""
+
 import torch.nn as nn
 import functools
 import torch
@@ -8,6 +22,16 @@ from .pix2pix import init_net, UnetSkipConnectionBlock, get_norm_layer, init_wei
 
 
 class ConvResBlock(nn.Module):
+    """下采样或同分辨率的卷积残差块。
+
+    作用：
+    - 作为编码器侧的基本 building block
+    - 支持保持尺寸不变，或通过 stride=2 做下采样
+
+    输入输出：
+    - 输入是四维图像特征 [B, C, H, W]
+    - 输出仍是四维图像特征
+    """
     def __init__(self, in_channel, out_channel, resize=False, act='relu'):
         super().__init__()
         self.resize = resize
@@ -44,16 +68,27 @@ class ConvResBlock(nn.Module):
 
     def forward(self, inputs):
         if not self.resize:
+            # 不下采样时，主分支输出与输入保持同一空间大小和通道数。
             h = self.main(inputs)
+            # 直接与输入做残差相加，形状保持 [B, C, H, W]。
             h += inputs
         else:
+            # 下采样时，主分支会把特征图分辨率缩小一半，并调整通道数。
             h = self.main(inputs)
+            # shortcut 分支同步做一次下采样，保证可以和主分支相加。
             res = self.residual(inputs)
             h += res
+        # 最后再经过一次激活，输出当前残差块的结果。
         return self.final_act(h)
 
 
 class DeconvResBlock(nn.Module):
+    """上采样或同分辨率的反卷积残差块。
+
+    作用：
+    - 与 ConvResBlock 对应，主要用于解码器侧
+    - 支持保持分辨率，或通过反卷积做上采样
+    """
     def __init__(self, in_channel, out_channel, resize=False, act='relu'):
         super().__init__()
         self.resize = resize
@@ -90,16 +125,31 @@ class DeconvResBlock(nn.Module):
 
     def forward(self, inputs):
         if not self.resize:
+            # 不上采样时，主分支保持输入输出分辨率一致。
             h = self.main(inputs)
             h += inputs
         else:
+            # 上采样时，主分支把空间分辨率放大一倍，并调整通道数。
             h = self.main(inputs)
+            # shortcut 分支也做同样的上采样，保证残差加法维度一致。
             res = self.residual(inputs)
             h += res
         return self.final_act(h)
 
 
 class ResScore(nn.Module):
+    """残差卷积-反卷积风格的 score network。
+
+    作用：
+    - 先编码输入图像，再解码回原分辨率
+    - 输出与输入同形状的 score field
+
+    输入：
+    - 一般是 [B, 3, H, W] 图像
+
+    输出：
+    - 与输入同尺寸的张量，表示每个像素位置的 score 估计
+    """
     def __init__(self, config):
         super().__init__()
         self.nef = config.model.nef
@@ -128,29 +178,32 @@ class ResScore(nn.Module):
         )
 
     def forward(self, x):
+        # 输入图像先从 (0, 1) 映射到 (-1, 1)。
         x = 2 * x - 1.
+        # 先经过编码器卷积残差块，空间分辨率逐步下降、通道数逐步增加。
+        # 例如 32x32 输入大致会变成更小分辨率的高维特征图。
+        encoded = self.convs(x)
+        # 再经过解码器反卷积残差块，逐步恢复到接近输入的空间尺寸。
+        res = self.deconvs(encoded)
         res = self.deconvs(self.convs(x))
         return res
 
 
 class ResNetScore(nn.Module):
-    """Resnet-based generator that consists of Resnet blocks between a few downsampling/upsampling operations.
+    """基于 ResNet generator 风格改造的 score network。
 
-    We adapt Torch code and idea from Justin Johnson's neural style transfer project(https://github.com/jcjohnson/fast-neural-style)
+    结构特点：
+    - 前面少量下采样
+    - 中间若干个 ResNet block
+    - 后面再上采样回原尺寸
+
+    作用：
+    - 适合作为图像到图像的残差变换网络
+    - 在这里被拿来近似 score function
     """
 
     def __init__(self, config):
-        """Construct a Resnet-based generator
-
-        Parameters:
-            input_nc (int)      -- the number of channels in input images
-            output_nc (int)     -- the number of channels in output images
-            ngf (int)           -- the number of filters in the last conv layer
-            norm_layer          -- normalization layer
-            use_dropout (bool)  -- if use dropout layers
-            n_blocks (int)      -- the number of ResNet blocks
-            padding_type (str)  -- the name of padding layer in conv layers: reflect | replicate | zero
-        """
+        """根据配置构造一个 ResNet 风格的 score 模型。"""
         super().__init__()
 
         input_nc = output_nc = config.data.channels
@@ -199,24 +252,24 @@ class ResNetScore(nn.Module):
 
     def forward(self, input):
         """Standard forward"""
+        # 把图像从 (0, 1) 映射到 (-1, 1) 后送入 ResNet generator 主体。
         input = 2 * input - 1.
+        # 输出与输入同分辨率、同通道数，用作 score 预测结果。
         return self.model(input)
 
 
 class UNetResScore(nn.Module):
-    def __init__(self, config):
-        """Construct a Unet generator
-        Parameters:
-            input_nc (int)  -- the number of channels in input images
-            output_nc (int) -- the number of channels in output images
-            num_downs (int) -- the number of downsamplings in UNet. For example, # if |num_downs| == 7,
-                                image of size 128x128 will become of size 1x1 # at the bottleneck
-            ngf (int)       -- the number of filters in the last conv layer
-            norm_layer      -- normalization layer
+    """带 ResNet 风格子块的 U-Net score network。
 
-        We construct the U-Net from the innermost layer to the outermost layer.
-        It is a recursive process.
-        """
+    作用：
+    - 通过 encoder-decoder + skip connection 保留多尺度信息
+    - 适合做图像级别的 score 预测
+
+    输出：
+    - 与输入图像同大小的 score 张量
+    """
+    def __init__(self, config):
+        """构造一个带 skip connection 的 U-Net 结构。"""
         super().__init__()
         # construct unet structure
         input_nc = output_nc = config.data.channels
@@ -246,25 +299,22 @@ class UNetResScore(nn.Module):
 
     def forward(self, input):
         """Standard forward"""
+        # 如果训练不是在 logit 空间中进行，这里会先把输入映射到 (-1, 1)。
         if not self.config.data.logit_transform:
             input = 2 * input - 1.
+        # U-Net 主体输出与输入同大小的张量，表示每个位置的 score。
         return self.model(input)
 
 
 class UNetScore(nn.Module):
-    def __init__(self, config):
-        """Construct a Unet generator
-        Parameters:
-            input_nc (int)  -- the number of channels in input images
-            output_nc (int) -- the number of channels in output images
-            num_downs (int) -- the number of downsamplings in UNet. For example, # if |num_downs| == 7,
-                                image of size 128x128 will become of size 1x1 # at the bottleneck
-            ngf (int)       -- the number of filters in the last conv layer
-            norm_layer      -- normalization layer
+    """标准 U-Net 风格的 score network。
 
-        We construct the U-Net from the innermost layer to the outermost layer.
-        It is a recursive process.
-        """
+    作用：
+    - 根据输入图像大小动态选择 U-Net 深度
+    - 输出与输入同形状的 score
+    """
+    def __init__(self, config):
+        """构造普通版 U-Net score 模型。"""
         super().__init__()
         # construct unet structure
         input_nc = output_nc = config.data.channels
@@ -300,12 +350,24 @@ class UNetScore(nn.Module):
 
     def forward(self, input):
         """Standard forward"""
+        # 与上面的 UNetResScore 相同，必要时先把输入映射到 (-1, 1)。
         if not self.config.data.logit_transform:
             input = 2 * input - 1.
+        # 经过 U-Net 编码器、瓶颈和解码器后，输出与输入同形状的 score 图。
         return self.model(input)
 
 
 class ResEnergy(nn.Module):
+    """卷积式 energy network。
+
+    作用：
+    - 输入图像
+    - 输出每个样本对应的一个标量能量
+
+    与 score network 的区别：
+    - score network 输出与输入同形状的梯度场
+    - energy network 先输出一个标量，再可通过对输入求导得到 score
+    """
     def __init__(self, config):
         super().__init__()
         self.nef = config.model.nef
@@ -321,13 +383,23 @@ class ResEnergy(nn.Module):
         )
 
     def forward(self, x):
+        # 先把图像值域映射到 (-1, 1)。
         x = 2 * x - 1.
+        # 经过卷积编码器后得到高层特征图，空间尺寸会变小、通道数会增加。
         res = self.convs(x)
+        # 展平并在特征维度求平均，最后每个样本输出一个标量能量，形状是 [batch]。
         res = res.view(res.shape[0], -1).mean(dim=-1)
         return res
 
 
 class MLPScore(nn.Module):
+    """适用于小尺寸输入的多层感知机 score network。
+
+    作用：
+    - 把输入展平成向量
+    - 用全连接网络预测 score
+    - 常用于 toy setting 或非常小分辨率输入
+    """
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -346,17 +418,27 @@ class MLPScore(nn.Module):
         )
 
     def forward(self, x):
+        # 把输入展平成 [batch, 100] 一类的二维张量，方便送入 MLP。
         x = x.view(x.shape[0], -1)
         if x.is_cuda and self.config.training.ngpu > 1:
+            # 多 GPU 时用 data_parallel 在不同卡上并行执行全连接网络。
             score = nn.parallel.data_parallel(
                 self.main, x, list(range(self.config.training.ngpu)))
         else:
             score = self.main(x)
 
+        # 再把输出 reshape 回 [batch, 1, 10, 10]，与原输入空间布局一致。
         return score.view(x.shape[0], 1, 10, 10)
 
 
 class LargeScore(nn.Module):
+    """较大容量的卷积 score network。
+
+    作用：
+    - 通过 U-Net 风格卷积结构提取空间特征
+    - 再通过全连接层做全局整合
+    - 适合 28x28 这类较标准的小图像输入
+    """
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -402,16 +484,25 @@ class LargeScore(nn.Module):
 
     def forward(self, x):
         if x.is_cuda and self.config.training.ngpu > 1:
+            # 多 GPU 时并行跑卷积 U-Net 主体。
             score = nn.parallel.data_parallel(
                 self.u_net, x, list(range(self.config.training.ngpu)))
         else:
             score = self.u_net(x)
+        # 先把卷积输出展平，再通过全连接层整合全局信息。
+        # 最终 reshape 成 [batch, channels, 28, 28]，输出和输入图像同大小。
         score = self.fc(score.view(x.shape[0], -1)).view(
             x.shape[0], self.config.data.channels, 28, 28)
         return score
 
 
 class Score(nn.Module):
+    """中等规模的卷积 score network。
+
+    作用：
+    - 与 LargeScore 结构相似，但卷积配置略有不同
+    - 常作为基础版 score 模型使用
+    """
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -457,16 +548,24 @@ class Score(nn.Module):
 
     def forward(self, x):
         if x.is_cuda and self.config.training.ngpu > 1:
+            # 多 GPU 并行执行卷积主干。
             score = nn.parallel.data_parallel(
                 self.u_net, x, list(range(self.config.training.ngpu)))
         else:
             score = self.u_net(x)
+        # 卷积特征经全连接层后，恢复成与输入同大小的 score 图。
         score = self.fc(score.view(x.shape[0], -1)).view(
             x.shape[0], self.config.data.channels, 28, 28)
         return score
 
 
 class SmallScore(nn.Module):
+    """适用于更小输入分辨率的轻量级 score network。
+
+    作用：
+    - 面向 10x10 这种更小的图像/网格输入
+    - 参数更少，计算也更轻
+    """
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -501,10 +600,12 @@ class SmallScore(nn.Module):
 
     def forward(self, x):
         if x.is_cuda and self.config.training.ngpu > 1:
+            # 小模型同样支持多 GPU 并行。
             score = nn.parallel.data_parallel(
                 self.u_net, x, list(range(self.config.training.ngpu)))
         else:
             score = self.u_net(x)
+        # 最终 reshape 成 [batch, channels, 10, 10]，适配小尺寸输入。
         score = self.fc(score.view(x.shape[0], -1)).view(
             x.shape[0], self.config.data.channels, 10, 10)
         return score
